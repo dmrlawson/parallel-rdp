@@ -1,0 +1,186 @@
+#version 450
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define CLUSTERER_NO_HELPER_INVOCATION
+
+#include "volumetric_fog.h"
+#include "lighting_scatter.h"
+#include "../inc/render_parameters.h"
+
+#ifndef TEMPORAL_REPROJECTION
+#define TEMPORAL_REPROJECTION 0
+#endif
+
+layout(push_constant, std430) uniform Registers
+{
+    mat4 inv_view_projection;
+    vec4 z_transform;
+    uvec3 count;
+    float dither_offset;
+    vec3 inv_resolution;
+    float in_scatter_strength;
+    vec2 xy_scale;
+    float slice_z_log2_scale;
+    float density_mod;
+} registers;
+
+float to_clip_z(float world_z)
+{
+    vec2 zw = registers.z_transform.zw - registers.z_transform.xy * world_z;
+    return zw.x / zw.y;
+}
+
+layout(constant_id = 0) const float POSITION_MOD = 0.4;
+layout(constant_id = 1) const float POSITION_MOD_LOW_FREQ = 0.0922556;
+
+layout(rgba16f, set = 2, binding = 0) writeonly uniform image3D uLightDensity;
+layout(set = 2, binding = 2) uniform mediump sampler3D uDitherLUT;
+
+layout(set = 2, binding = 3) uniform mediump sampler3D uFogDensity;
+layout(set = 2, binding = 4) uniform mediump sampler3D uFogDensityLowFreq;
+
+layout(std140, set = 2, binding = 1) uniform BlockExtents
+{
+    vec4 slice_extents[1024 / 4];
+};
+
+#if TEMPORAL_REPROJECTION
+layout(set = 2, binding = 5) uniform mediump sampler3D uOldLightDensity;
+layout(std140, set = 2, binding = 6) uniform Temporal
+{
+    mat4 old_view_projection;
+    vec4 inv_z_transform;
+};
+
+float to_world_z(float clip_z)
+{
+    vec2 zw = inv_z_transform.xy * clip_z + inv_z_transform.zw;
+    return -zw.x / zw.y;
+}
+#endif
+
+vec3 get_world_position(vec3 uvw)
+{
+    float world_z = volumetric_fog_texture_z_to_world(uvw.z, registers.slice_z_log2_scale);
+    float clip_z = to_clip_z(world_z);
+    vec4 clip = registers.inv_view_projection * vec4(uvw.xy * 2.0 - 1.0, clip_z, 1.0);
+    vec3 pos = clip.xyz / clip.w;
+    return pos;
+}
+
+float get_fog_albedo(vec3 uvw)
+{
+    // TODO: Modulate density based on pos.
+    float length_mod = length(vec3(1.0, (uvw.xy * 2.0 - 1.0) * registers.xy_scale));
+    float albedo = registers.density_mod * slice_extents[gl_WorkGroupID.z][gl_LocalInvocationID.z] * length_mod;
+    return albedo;
+}
+
+vec3 compute_inscatter_light(vec3 pos)
+{
+#ifdef SHADOWS
+#ifdef SHADOW_CASCADES
+    vec4 clip_shadow_near = shadow.near * vec4(pos, 1.0);
+#else
+    vec4 clip_shadow_near = vec4(0.0);
+#endif
+    vec4 clip_shadow_far = shadow.far * vec4(pos, 1.0);
+#endif
+
+    return compute_scatter_lighting(
+        pos,
+        global.camera_position,
+        global.camera_front,
+        directional.direction,
+        directional.color
+#ifdef SHADOWS
+		, clip_shadow_near, clip_shadow_far, shadow.inv_cutoff_distance
+#endif
+#ifdef ENVIRONMENT
+        , environment.intensity
+#endif
+    );
+}
+
+#ifdef FLOOR_LIGHTING
+layout(set = 2, binding = 7) uniform mediump sampler2D uFloorLight;
+layout(set = 2, binding = 8, std140) uniform FloorData
+{
+    float pos_mod;
+    float base_y;
+    float y_mod;
+    float scatter_mod;
+} floor_lighting;
+
+mediump vec3 compute_floor_inscatter_light(vec3 pos)
+{
+    vec2 uv = pos.xz * floor_lighting.pos_mod;
+    mediump float y = pos.y - floor_lighting.base_y;
+    y *= floor_lighting.y_mod;
+    y = max(y, 0.0) + 1.0;
+
+    mediump float lod = log2(y);
+    mediump float dir_y = normalize(pos - global.camera_position).y;
+    mediump float phase = 0.55 - 0.45 * dir_y;
+
+    return textureLod(uFloorLight, uv, lod).rgb * (phase * floor_lighting.scatter_mod / (1.0 + 2.0 * lod));
+}
+#endif
+
+void main()
+{
+    if (any(greaterThanEqual(gl_GlobalInvocationID, registers.count)))
+        return;
+
+    vec3 uvw = (vec3(gl_GlobalInvocationID) + 0.5) * registers.inv_resolution;
+
+#if TEMPORAL_REPROJECTION
+    mediump vec4 old_in_scatter_light_albedo = vec4(0.0);
+    mediump float w = 1.0;
+    vec3 undither_pos = get_world_position(uvw);
+    vec4 old_clip = old_view_projection * vec4(undither_pos, 1.0);
+    if (old_clip.w > 0.0)
+    {
+        vec3 old_ndc = old_clip.xyz / old_clip.w;
+        if (all(lessThanEqual(abs(old_ndc.xy), vec2(1.0))))
+        {
+            if (old_ndc.z > 0.0)
+            {
+                float old_world_z = to_world_z(old_ndc.z);
+                float tex_z = volumetric_fog_world_to_texture_z(old_world_z, registers.slice_z_log2_scale);
+                old_in_scatter_light_albedo = textureLod(uOldLightDensity, vec3(0.5 * old_ndc.xy + 0.5, tex_z), 0.0);
+                w = 1.0 / 10.0;
+            }
+        }
+    }
+#endif
+
+    vec3 dither = textureLod(uDitherLUT, 4.0 * (vec3(gl_GlobalInvocationID) + registers.dither_offset + 0.5) * registers.inv_resolution, 0.0).xyz;
+    dither.x -= 0.5;
+    dither.y -= 0.5;
+    dither.z = -dither.z;
+    uvw += dither * registers.inv_resolution;
+    uvw = clamp(uvw, vec3(0.0, 0.0, 0.001), vec3(1.0));
+
+    vec3 pos = get_world_position(uvw);
+
+    mediump float fog_density = textureLod(uFogDensity, pos * POSITION_MOD, 0.0).x +
+                                0.5 * textureLod(uFogDensityLowFreq, (pos + 1.0) * POSITION_MOD_LOW_FREQ, 0.0).x;
+
+    mediump float albedo = get_fog_albedo(uvw) * fog_density;
+    mediump vec3 in_scatter_light = registers.in_scatter_strength * compute_inscatter_light(pos);
+
+#ifdef FLOOR_LIGHTING
+    in_scatter_light += compute_floor_inscatter_light(pos);
+#endif
+
+#if TEMPORAL_REPROJECTION
+    in_scatter_light = mix(old_in_scatter_light_albedo.rgb, in_scatter_light, w);
+    albedo = mix(old_in_scatter_light_albedo.w, albedo, w);
+    // Avoid albedo hitting infinity, since it will trigger NaN later in the pipeline.
+    // i.e. exp2(-inf) * inf == NaN.
+    albedo = clamp(albedo, 0.0, 10000.0);
+#endif
+
+    imageStore(uLightDensity, ivec3(gl_GlobalInvocationID), vec4(in_scatter_light, albedo));
+}

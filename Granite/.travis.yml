@@ -1,0 +1,65 @@
+language:
+  - cpp
+  - python
+
+matrix:
+  include:
+    - os: linux
+      dist: xenial
+      compiler: gcc
+      before_install:
+        - sudo apt-get install xorg-dev
+      env:
+        - GENERATOR="Unix Makefiles"
+        - PLATFORM=GLFW
+    - os: linux
+      dist: xenial
+      compiler: clang
+      env:
+        - GENERATOR="Unix Makefiles"
+        - PLATFORM=KHR_DISPLAY
+    - os: linux
+      dist: xenial
+      compiler: clang
+      env:
+        - GENERATOR="Unix Makefiles"
+        - PLATFORM=libretro
+    - os: windows
+      before_install:
+        - choco install python3
+        - export PATH="/c/Python38:/c/Python38/Scripts:$PATH"
+      env:
+        - GENERATOR="Visual Studio 15 2017"
+        - PLATFORM=GLFW
+    - os: windows
+      before_install:
+        - choco install python3
+        - export PATH="/c/Python38:/c/Python38/Scripts:$PATH"
+      env:
+        - GENERATOR="Visual Studio 15 2017 Win64"
+        - PLATFORM=GLFW
+    - os: windows
+      before_install:
+        - choco install python3
+        - export PATH="/c/Python38:/c/Python38/Scripts:$PATH"
+      env:
+        - GENERATOR="Visual Studio 15 2017"
+        - PLATFORM=libretro
+    - os: windows
+      before_install:
+        - choco install python3
+        - export PATH="/c/Python38:/c/Python38/Scripts:$PATH"
+      env:
+        - GENERATOR="Visual Studio 15 2017 Win64"
+        - PLATFORM=libretro
+
+before_script:
+  - git submodule update --init
+
+script:
+  - if [[ "$TRAVIS_OS_NAME" == "windows" ]]; then PYTHON3=$(which python); fi
+  - if [[ "$TRAVIS_OS_NAME" != "windows" ]]; then PYTHON3=$(which python3); fi
+  - mkdir build
+  - cd build
+  - cmake .. -DCMAKE_BUILD_TYPE=Release -DGRANITE_PLATFORM=${PLATFORM} -G "${GENERATOR}" -DPYTHON_EXECUTABLE="${PYTHON3}"
+  - cmake --build . --config Release
